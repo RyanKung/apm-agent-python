@@ -45,6 +45,7 @@ from elasticapm.utils import build_name_with_http_method_prefix
 from elasticapm.utils.disttracing import TraceParent
 from elasticapm.utils.logging import get_logger
 from functools import wraps
+import threading
 
 logger = get_logger("elasticapm.errors.client")
 
@@ -58,80 +59,92 @@ def make_client(client_cls, config, **defaults):
     client = client_cls(config, **defaults)
     return client
 
+
 class RequestHeaderValidatorInterceptor(grpc.ServerInterceptor):
-     '''
-     the actual Python implementation only allows developers to interact with the invocation metadata,
-     or route the RPC to a newly defined method handler.
-     It has no control over the invocation of actual user-defined request handler,
-     hence the response message and the raised exception will not be propagated to the interceptor function.
-     ref: https://github.com/grpc/proposal/blob/master/L13-python-interceptors.md
+    """
+    grpc application for Elastic APM
 
-     '''
-     def __init__(self, client=None, client_cls=Client, logging=False, config={}, **defaults):
-          self.logging = logging
-          self.config = config
-          self.client = client
-          self.client_cls = client_cls
+    """
+    def __init__(self, client=None, client_cls=Client, logging=False, config={}, **defaults):
+        self.logging = logging
+        self.config = config
+        self.client = client
+        self.client_cls = client_cls
 
-          if not self.client:
-               self.client = make_client(self.client_cls, self.config, **defaults)
-          self.setup_logging()
-          self.setup_instrument()
+        if not self.client:
+            self.client = make_client(
+                self.client_cls, self.config, **defaults)
+        self.setup_logging()
+        self.setup_instrument()
 
-     def setup_logging(self):
-          if self.logging or self.logging is logging.NOTSET:
-               if self.logging is not True:
-                    kwargs = {"level": self.logging}
-               else:
-                    kwargs = {}
-               setup_logging(LoggingHandler(self.client, **kwargs))
+    def setup_logging(self):
+        if self.logging or self.logging is logging.NOTSET:
+            if self.logging is not True:
+                kwargs = {"level": self.logging}
+            else:
+                kwargs = {}
+            setup_logging(LoggingHandler(self.client, **kwargs))
 
-     def setup_instrument(self):
-          if self.client.config.instrument and self.client.config.enabled:
-               elasticapm.instrumentation.control.instrument()
-          try:
-               from elasticapm.contrib.celery import register_instrumentation
-               register_instrumentation(self.client)
-          except ImportError:
-               pass
-          else:
-               logger.debug("Skipping instrumentation. INSTRUMENT is set to False.")
+    def setup_instrument(self):
+        if self.client.config.instrument and self.client.config.enabled:
+            elasticapm.instrumentation.control.instrument()
+        try:
+            from elasticapm.contrib.celery import register_instrumentation
+            register_instrumentation(self.client)
+        except ImportError:
+            pass
+        else:
+            logger.debug(
+                "Skipping instrumentation. INSTRUMENT is set to False.")
 
-     def wrap_response(self, response_future):
-          def wrap_method(fn):
-               @wraps(fn)
-               def _(*args, **kwargs):
-                    result = fn(*args, **kwargs)
-                    elasticapm.set_transaction_result(result, override=False)
-                    self.client.end_transaction()
-                    return result
-               return _
+    def wrap_response(self, response_future, tx):
+        def wrap_method(fn):
+            @wraps(fn)
+            def _(*args, **kwargs):
+                execution_context.set_transaction(tx)
+                result = fn(*args, **kwargs)
+                self.request_finished(result)
+                return result
+            return _
 
-          multable_response = response_future._asdict()
+        multable_response = response_future._asdict()
 
-          if response_future.unary_unary:
-               multable_response["unary_unary"] = wrap_method(response_future.unary_unary)
-          if response_future.unary_stream:
-               multable_response["unary_stream"] = wrap_method(response_future.unary_stream)
-          if response_future.stream_unary:
-               multable_response["unary_stream"] = wrap_method(response_future.steam_unary)
-          if response_future.stream_stream:
-               multable_response["stream_stream"] = wrap_method(response_future.steam_steam)
-          return response_future.__class__(**multable_response)
+        if response_future.unary_unary:
+            multable_response["unary_unary"] = wrap_method(
+                response_future.unary_unary)
+        if response_future.unary_stream:
+            multable_response["unary_stream"] = wrap_method(
+                response_future.unary_stream)
+        if response_future.stream_unary:
+            multable_response["unary_stream"] = wrap_method(
+                response_future.steam_unary)
+        if response_future.stream_stream:
+            multable_response["stream_stream"] = wrap_method(
+                response_future.steam_steam)
+        return response_future.__class__(**multable_response)
 
+    def with_transaction(self, handler_call_details, continuation):
+        if self.client.config.debug:
+            return continuation(handler_call_details)
+        self.request_started(handler_call_details)
+        tx = execution_context.get_transaction()
+        response_future = continuation(handler_call_details)
+        # Cross thread here
+        ret = self.wrap_response(response_future, tx)
+        return ret
 
+    def request_started(self, handler_call_details):
+        meta_data = handler_call_details.invocation_metadata[0]._asdict()
+        trace_parent = TraceParent.from_headers(meta_data)
+        method = handler_call_details.method
+        self.client.begin_transaction("request", trace_parent=trace_parent)
+        elasticapm.set_context(meta_data, "request")
+        elasticapm.set_transaction_name("gRPC %s" % method)
 
-     def with_transaction(self, handler_call_details, continuation):
-          if self.client.config.debug:
-               return continuation(handler_call_details)
+    def request_finished(self, result):
+        result_handler = self.config.get("RESULT_HANDLER", lambda x: bool(x) and "SUCC" or "FAIL")
+        elasticapm.set_transaction_result(result_handler(result.message), override=False)
+        self.client.end_transaction()
 
-          trace_parent = TraceParent.from_headers(handler_call_details.invocation_metadata[0]._asdict())
-          method = handler_call_details.method
-          self.client.begin_transaction("request", trace_parent=trace_parent)
-          elasticapm.set_transaction_name("gRPC %s" % method)
-          response_future = continuation(handler_call_details)
-          return self.wrap_response(response_future)
-
-
-     def intercept_service(self, continuation, handler_call_details):
-          return self.with_transaction(handler_call_details, continuation)
+    def intercept_service(self, continuation, handler_call_details):
+        return self.with_transaction(handler_call_details, continuation)
