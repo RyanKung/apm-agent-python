@@ -31,7 +31,6 @@ class RPCGreeterServerTest(unittest.TestCase):
             futures.ThreadPoolExecutor(max_workers=10),
             interceptors=(
                 RequestHeaderValidatorInterceptor(config=ELASTIC_APM_CONFIG),
-                RequestHeaderValidatorInterceptor(config=ELASTIC_APM_CONFIG),
             )
         )
         helloworld_pb2_grpc.add_GreeterServicer_to_server(self.server_class(), self.server)
