@@ -44,8 +44,9 @@ from elasticapm.traces import execution_context
 from elasticapm.utils import build_name_with_http_method_prefix
 from elasticapm.utils.disttracing import TraceParent
 from elasticapm.utils.logging import get_logger
+from elasticapm.utils import get_url_dict
 from functools import wraps
-import threading
+
 
 logger = get_logger("elasticapm.errors.client")
 
@@ -64,6 +65,40 @@ class RequestHeaderValidatorInterceptor(grpc.ServerInterceptor):
     """
     grpc application for Elastic APM
 
+    Look up configuration from ``os.environ.get('ELASTIC_APM_APP_NAME')`` and
+    ``os.environ.get('ELASTIC_APM_SECRET_TOKEN')``::
+
+    >>> ELASTIC_APM_CONFIG = {
+    ...  "SERVICE_NAME": "grpcapp",
+    ... "SECRET_TOKEN": "changeme",
+    ... }
+
+    >>> interceptor = RequestHeaderValidatorInterceptor(
+    ... config=ELASTIC_APM_CONFIG,
+    ... )
+
+    Automatically configure logging::
+
+     >>> interceptor = RequestHeaderValidatorInterceptor(
+    ... config=ELASTIC_APM_CONFIG,
+    ... logging=True
+    ... )
+
+    May start your grpc server with:
+    >>> grpc.server(
+    ... futures.ThreadPoolExecutor(max_workers=10),
+    ... interceptors=(interceptor,)
+
+    Customize response status:
+    >>> ELASTIC_APM_CONFIG = {
+    ...  "SERVICE_NAME": "grpcapp",
+    ... "SECRET_TOKEN": "changeme",
+    ... "RESULT_HANDLER": lambda msg: "You" in msg and "SUCC" or "FAIL"
+    ... }
+
+    The RESULT_HANDLER is a function for handler response.message for determining success or failed
+    should be a callable object that follow:
+    Callable[str] -> bool
     """
     def __init__(self, client=None, client_cls=Client, logging=False, config={}, **defaults):
         self.logging = logging
@@ -97,11 +132,17 @@ class RequestHeaderValidatorInterceptor(grpc.ServerInterceptor):
             logger.debug(
                 "Skipping instrumentation. INSTRUMENT is set to False.")
 
-    def wrap_response(self, response_future, tx):
+    def wrap_response(self, response_future, method, tx):
         def wrap_method(fn):
             @wraps(fn)
             def _(*args, **kwargs):
                 execution_context.set_transaction(tx)
+                request = args[1]
+                elasticapm.set_context({
+                    "url": get_url_dict(method),
+                    "body": str(request),
+                    "method": "GRPC"
+                }, "request")
                 result = fn(*args, **kwargs)
                 self.request_finished(result)
                 return result
@@ -126,11 +167,16 @@ class RequestHeaderValidatorInterceptor(grpc.ServerInterceptor):
     def with_transaction(self, handler_call_details, continuation):
         if self.client.config.debug:
             return continuation(handler_call_details)
+
         self.request_started(handler_call_details)
+
         tx = execution_context.get_transaction()
         response_future = continuation(handler_call_details)
         # Cross thread here
-        ret = self.wrap_response(response_future, tx)
+
+        method = handler_call_details.method
+        elasticapm.set_transaction_name("gRPC %s" % method)
+        ret = self.wrap_response(response_future, method, tx)
         return ret
 
     def request_started(self, handler_call_details):
@@ -138,8 +184,7 @@ class RequestHeaderValidatorInterceptor(grpc.ServerInterceptor):
         trace_parent = TraceParent.from_headers(meta_data)
         method = handler_call_details.method
         self.client.begin_transaction("request", trace_parent=trace_parent)
-        elasticapm.set_context(meta_data, "request")
-        elasticapm.set_transaction_name("gRPC %s" % method)
+#        elasticapm.set_context(self._get_data(handler_call_details), "request")
 
     def request_finished(self, result):
         result_handler = self.config.get("RESULT_HANDLER", lambda x: bool(x) and "SUCC" or "FAIL")
