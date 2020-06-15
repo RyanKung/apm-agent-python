@@ -137,7 +137,7 @@ class RequestHeaderValidatorInterceptor(grpc.ServerInterceptor):
             @wraps(fn)
             def _(*args, **kwargs):
                 execution_context.set_transaction(tx)
-                request = args[1]
+                request = args[0]
                 elasticapm.set_context({
                     "url": get_url_dict(method),
                     "body": str(request),
